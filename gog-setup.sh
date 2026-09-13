@@ -57,6 +57,22 @@ detect_heroic_config_dir() {
     echo "${best:-${candidates[0]}}"
 }
 
+# Heroic's per-game launch logs (used by `diagnose`) live under a sibling
+# ".local/state/Heroic" tree, sandboxed the same way as its config - mirror
+# whichever candidate detect_heroic_config_dir() actually picked rather than
+# re-deriving it by string surgery (native's ".config" has a leading dot the
+# other two don't, so a blind suffix swap isn't safe).
+detect_heroic_state_dir() {
+    case "$HEROIC_CONFIG_DIR" in
+        "$HOME/.var/app/com.heroicgameslauncher.hgl/config/heroic")
+            echo "$HOME/.var/app/com.heroicgameslauncher.hgl/.local/state/Heroic" ;;
+        "$HOME/snap/heroic/current/.config/heroic")
+            echo "$HOME/snap/heroic/current/.local/state/Heroic" ;;
+        *)
+            echo "$HOME/.local/state/Heroic" ;;
+    esac
+}
+
 # --- Game Registry / Companion Settings ---
 GAMES_DIR="${GOG_GAMES_DIR:-$HOME/Games/Heroic}"
 CONFIG_DIR="$HOME/.config/gog-companion"
@@ -66,6 +82,7 @@ STEAM_FAKE_CLIENT_DIR="$CONFIG_DIR/fake-steam-client"
 HEROIC_CONFIG_DIR="${GOG_HEROIC_CONFIG_DIR:-$(detect_heroic_config_dir)}"
 HEROIC_GAMES_CONFIG_DIR="$HEROIC_CONFIG_DIR/GamesConfig"
 HEROIC_INSTALLED_FILE="$HEROIC_CONFIG_DIR/gog_store/installed.json"
+HEROIC_STATE_DIR="$(detect_heroic_state_dir)"
 LOCK_FILE="$CONFIG_DIR/companion.lock"
 CNC_DDRAW_DIR="$HOME/GOG_Fixes/cnc-ddraw"
 COMMAND="all"
@@ -82,6 +99,52 @@ ONLY_FILTER=""
 declare -A NEEDS_CNC_DDRAW=(
     [1207659104]=1   # Worms 2
 )
+
+# Games (by GOG id) confirmed to crash Wine's DirectShow/GStreamer pipeline
+# outright - not just fail to decode, an actual unhandled exception - the
+# instant they try to play an intro/cutscene video, on this Proton build.
+# Confirmed for Worms Forts: Under Siege via `diagnose`: the crash backtrace
+# leads into winegstreamer/quartz, which needs libvpx.so.9/libtheoradec.so.1
+# for the game's .mpg videos - sonames current Ubuntu no longer packages at
+# all (only newer, ABI-incompatible .so.12/.so.2 exist), and Proton's own
+# launch script unconditionally overwrites GST_PLUGIN_SYSTEM_PATH_1_0 to
+# point only at its own (equally broken) bundled plugins, so installing
+# system GStreamer packages can't reach the problem either way. The fix is
+# the same one many of this era's GOG games expose as an in-game "skip
+# intro" option, applied from outside instead: move the video files aside so
+# DirectShow has nothing to open. Each entry names a glob (relative to the
+# game's install dir) of the files responsible.
+declare -A DISABLE_FMV_GLOB=(
+    [1207659170]="data/FMV/*.mpg"   # Worms Forts: Under Siege
+)
+
+# Move a game's crash-triggering video files into a same-directory backup
+# folder - reversible (move them back to undo) and easy to find later if a
+# working Proton/Wine-GE build ever makes them playable again.
+apply_disable_fmv() {
+    local game_dir="$1" glob="$2" backup_dir f moved=0
+    backup_dir="$(dirname "$game_dir/$glob")/gog-companion-disabled"
+    mkdir -p "$backup_dir"
+    for f in "$game_dir"/$glob; do
+        [ -f "$f" ] || continue
+        mv "$f" "$backup_dir/$(basename "$f")"
+        moved=$((moved + 1))
+    done
+    if [ "$moved" -gt 0 ]; then
+        log_success "  Moved $moved crash-triggering video file(s) aside to $backup_dir (reversible - move them back if a future Proton build fixes this)."
+    fi
+}
+
+# Whether any file matching a DISABLE_FMV_GLOB entry is still where the game
+# expects it (i.e. not yet moved aside) - self-idempotent the same way as
+# the launcher-override fix: once applied, there's nothing left to detect.
+fmv_needs_disabling() {
+    local game_dir="$1" glob="$2" f
+    for f in "$game_dir"/$glob; do
+        [ -f "$f" ] && return 0
+    done
+    return 1
+}
 
 # Every log_* call is echoed to the console (colored) and appended to
 # LOG_FILE (plain, timestamped) so runs can be reviewed after the fact.
@@ -210,7 +273,17 @@ update_and_install_deps() {
     log_info "Updating package lists..."
     sudo apt-get update -y
 
-    log_info "Installing core gaming libraries, 32-bit graphics/sound drivers, and utilities..."
+    # 32-bit GStreamer plugins (gstreamer1.0-plugins-*:i386, gstreamer1.0-libav:i386)
+    # are included below because Wine's winegstreamer (DirectShow media backend,
+    # used by many 90s/00s games for FMV intros) runs as a 32-bit WoW64 process
+    # and can't load 64-bit .so plugins at all. Ubuntu ships GStreamer 64-bit
+    # only by default, so without these a game hits "wrong ELF class: ELFCLASS64"
+    # for every single plugin and then segfaults inside winegstreamer/quartz
+    # trying to decode video with no working plugin found, instead of failing
+    # gracefully - confirmed by tracing exactly this crash in Worms Forts: Under
+    # Siege down to an unhandled page fault in msvcrt, called from quartz/
+    # winegstreamer during what should have been its intro video.
+    log_info "Installing core gaming libraries, 32-bit graphics/sound/media drivers, and utilities..."
     sudo apt-get install -y \
         software-properties-common \
         wget \
@@ -228,6 +301,12 @@ update_and_install_deps() {
         libvulkan1:i386 \
         libasound2-plugins:i386 \
         libpulse0:i386 \
+        libgstreamer1.0-0:i386 \
+        gstreamer1.0-plugins-base:i386 \
+        gstreamer1.0-plugins-good:i386 \
+        gstreamer1.0-plugins-bad:i386 \
+        gstreamer1.0-plugins-ugly:i386 \
+        gstreamer1.0-libav:i386 \
         gamemode \
         mangohud \
         flatpak \
@@ -770,6 +849,16 @@ verify_games() {
         log_warn "winetricks not found; dependency checks will be skipped. Run '$SCRIPT_NAME setup' first."
     fi
 
+    # A missing 32-bit GStreamer install doesn't fail any single verb check -
+    # it just makes any game with a DirectShow FMV intro or cutscene crash
+    # instantly the moment it tries to play one (confirmed root cause for
+    # Worms Forts: Under Siege - see 'diagnose'). Flagged once here, system-
+    # wide, rather than per-game, since it's the same fix for every game hit
+    # by it.
+    if ! find /usr/lib/i386-linux-gnu/gstreamer-1.0 -maxdepth 1 -iname "*.so" -print -quit 2>/dev/null | grep -q .; then
+        log_warn "No 32-bit GStreamer plugins found; any game with a DirectShow FMV intro/cutscene will likely crash on launch. Run '$SCRIPT_NAME setup' to install them."
+    fi
+
     i=0
     while [ "$i" -lt "$count" ]; do
         local entry id name exe prefix engine wrapper status missing_json installed_list missing verb wine_bin wineserver_bin launcher_override game_dir info_file
@@ -857,6 +946,16 @@ verify_games() {
                 :
             else
                 [ "$AUTO_FIX" != true ] && log_info "  Tip: run '$SCRIPT_NAME patch' to copy it in automatically."
+                [ "$status" = "ok" ] && status="needs_deps"
+            fi
+        fi
+
+        if [ -n "${DISABLE_FMV_GLOB[$id]:-}" ] && [ -n "$game_dir" ] && fmv_needs_disabling "$game_dir" "${DISABLE_FMV_GLOB[$id]}"; then
+            log_warn "  This title's intro/cutscene videos crash Wine's GStreamer pipeline outright on this Proton build (see 'diagnose' / README finding #17)."
+            if [ "$AUTO_FIX" = true ]; then
+                apply_disable_fmv "$game_dir" "${DISABLE_FMV_GLOB[$id]}"
+            else
+                log_info "  Tip: run '$SCRIPT_NAME patch' to move them aside automatically (reversible)."
                 [ "$status" = "ok" ] && status="needs_deps"
             fi
         fi
@@ -1042,6 +1141,95 @@ list_games() {
     echo ""
 }
 
+# Known crash signatures, keyed by a substring of a module name from Wine's
+# own crash backtrace. This is what turns "spend 20 minutes reading a
+# launch.log line by line" (how the GStreamer fix in `setup` was actually
+# found, for Worms Forts: Under Siege) into a single command - and it
+# generalizes to any future game that crashes the same way, not just the
+# ones this project happened to test against.
+crash_module_hint() {
+    local module_lc="${1,,}"
+    case "$module_lc" in
+        # Wine's own built-in, unversioned C runtime - present in almost
+        # every crash's leaf frame (it's whoever last called memcpy), never
+        # diagnostic on its own. Must be checked before the msvcr* pattern
+        # below, which would otherwise match this generic frame first and
+        # mask the real cause one or two frames further down the same stack.
+        msvcrt)
+            echo "" ;;
+        *winegstreamer*|*quartz*)
+            echo "Wine's DirectShow/media backend (FMV intro or cutscene video). Run '$SCRIPT_NAME setup' to install 32-bit GStreamer plugins first. If it still crashes after that, the Proton build's bundled plugins may themselves be missing a codec library current Ubuntu no longer packages (confirmed for Worms Forts: Under Siege - see README finding #18) - '$SCRIPT_NAME patch' applies a per-game fix for titles this is confirmed on." ;;
+        *d3d9*|*d3d11*|*d3d12*)
+            echo "Direct3D. Make sure this game's redistributables are installed (run '$SCRIPT_NAME patch'), or try a different Proton/Wine-GE build via ProtonUp-Qt." ;;
+        *dxvk*)
+            echo "DXVK (D3D-to-Vulkan translation) itself crashed. Try updating your GPU driver, or disabling DXVK for this game in Heroic's settings." ;;
+        *vkd3d*)
+            echo "VKD3D (D3D12-to-Vulkan translation) crashed. Try a different Proton build via ProtonUp-Qt." ;;
+        *msvcp*|msvcr[0-9]*|*ucrtbase*|*vcruntime*)
+            echo "A Microsoft C/C++ runtime crashed. The vcrun redistributable may be missing or corrupt - run '$SCRIPT_NAME patch'." ;;
+        *xaudio*|*xactengine*)
+            echo "XAudio2/XACT audio. Run '$SCRIPT_NAME patch' to (re)install the xact/xact_x64 winetricks verbs." ;;
+        *)
+            echo "" ;;
+    esac
+}
+
+# Inspect one game's most recent Heroic launch log and report whether it
+# crashed inside Wine (an actual exception, distinct from a silent hang like
+# Worms 2's GOGLauncher.exe - that class of issue is already caught by the
+# broken-launcher check, not this one), with a plain-language cause where
+# the crashing module is recognized.
+diagnose_game() {
+    local id="$1" name="$2" log="$HEROIC_STATE_DIR/logs/games/${id}_gog/launch.log" modules module hint=""
+
+    log_info "Diagnosing: $name"
+
+    if [ ! -f "$log" ]; then
+        log_info "  Never launched from Heroic yet (no launch log found at $log)."
+        return 0
+    fi
+
+    if ! grep -q "Unhandled exception" "$log" 2>/dev/null; then
+        log_success "  Last launch log shows no Wine-level crash."
+        log_info "  (A silent hang with no crash won't show here - if it never shows a window, check 'ps aux' for a live-but-idle process.)"
+        return 0
+    fi
+
+    modules=$(grep -A20 "^Backtrace:" "$log" | grep -oP 'in \K[A-Za-z0-9_.]+(?= \()' 2>/dev/null)
+    for module in $modules; do
+        hint=$(crash_module_hint "$module")
+        if [ -n "$hint" ]; then
+            log_warn "  Last launch crashed inside Wine ($module)."
+            log_info "  Likely cause: $hint"
+            log_info "  Full log: $log"
+            return 0
+        fi
+    done
+
+    log_warn "  Last launch crashed inside Wine, but the crashing module isn't one of the recognized patterns."
+    log_info "  Look for 'Backtrace:' in the log and check the modules listed there: $log"
+}
+
+diagnose_games() {
+    if [ ! -f "$REGISTRY_FILE" ] || [ "$(jq 'length' "$REGISTRY_FILE")" -eq 0 ]; then
+        log_warn "No games registered yet. Run '$SCRIPT_NAME scan' first."
+        return 0
+    fi
+
+    local count i id name engine
+    count=$(jq 'length' "$REGISTRY_FILE")
+    i=0
+    while [ "$i" -lt "$count" ]; do
+        id=$(jq -r ".[$i].id" "$REGISTRY_FILE")
+        name=$(jq -r ".[$i].name" "$REGISTRY_FILE")
+        engine=$(jq -r ".[$i].engine // \"wine\"" "$REGISTRY_FILE")
+        if [ "$engine" = "wine" ] && matches_only_filter "$id" "$name"; then
+            diagnose_game "$id" "$name"
+        fi
+        i=$((i + 1))
+    done
+}
+
 usage() {
     local text
     text=$(cat << EOF
@@ -1055,13 +1243,14 @@ ${BOLD}${CYAN}Commands:${NC}
   ${GREEN}list${NC}        Print the current game registry (name, ready/status, runner, prefix)
   ${GREEN}patch${NC}       scan + auto-create missing Wine prefixes + install missing deps + list
   ${GREEN}doctor${NC}      scan + verify + list, without touching system packages
+  ${GREEN}diagnose${NC}    Inspect Heroic's own launch logs for Wine-level crashes and explain them
   ${GREEN}logs${NC}        Show the companion log file (every scan/verify/patch action, timestamped)
   ${GREEN}help${NC}        Show this help message
 
 ${BOLD}${CYAN}Options:${NC}
   ${YELLOW}-d, --games-dir <path>${NC}          Games directory to scan (default: $GAMES_DIR)
   ${YELLOW}-c, --heroic-config-dir <path>${NC}  Heroic config dir (default: auto-detected; currently $HEROIC_CONFIG_DIR)
-  ${YELLOW}--only <name-or-id>${NC}             Limit scan/verify/patch/doctor to one game (name substring or GOG id)
+  ${YELLOW}--only <name-or-id>${NC}             Limit scan/verify/patch/doctor/diagnose to one game (name substring or GOG id)
   ${YELLOW}-y, --yes${NC}                       Non-interactive mode (assume yes / pick defaults)
   ${YELLOW}-f, --fix${NC}                       Auto-install missing Winetricks components during verify
   ${YELLOW}-h, --help${NC}                      Show this help message
@@ -1073,7 +1262,7 @@ EOF
 main() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            all|setup|scan|verify|list|patch|doctor|logs|help)
+            all|setup|scan|verify|list|patch|doctor|diagnose|logs|help)
                 COMMAND="$1"; shift ;;
             -d|--games-dir)
                 GAMES_DIR="$2"; shift 2 ;;
@@ -1081,6 +1270,7 @@ main() {
                 HEROIC_CONFIG_DIR="$2"
                 HEROIC_GAMES_CONFIG_DIR="$HEROIC_CONFIG_DIR/GamesConfig"
                 HEROIC_INSTALLED_FILE="$HEROIC_CONFIG_DIR/gog_store/installed.json"
+                HEROIC_STATE_DIR="$(detect_heroic_state_dir)"
                 shift 2 ;;
             --only)
                 ONLY_FILTER="$2"; shift 2 ;;
@@ -1141,6 +1331,11 @@ main() {
             scan_games "$GAMES_DIR"
             verify_games
             list_games
+            ;;
+        diagnose)
+            ensure_jq
+            init_registry
+            diagnose_games
             ;;
         logs)
             if [ -f "$LOG_FILE" ]; then

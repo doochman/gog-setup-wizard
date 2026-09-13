@@ -1,37 +1,54 @@
 # GOG Companion for Heroic
 
 **A single bash script that reverse-engineers how Heroic actually runs your
-GOG games — then fixes the ones that are broken, automatically.**
+GOG games — then fixes the ones that are broken, automatically. When it
+can't fix something outright, it tells you exactly what's wrong and why,
+instead of leaving you to grep Wine logs at midnight.**
 
 Not "install some packages and hope." This script reads Heroic's own
 `GamesConfig`, matches the *exact* Proton build it configured per game,
-replicates Heroic's on-disk prefix layout byte-for-byte, and works around
-three separate real-world Wine/Winetricks/Flatpak bugs it took actual
-reverse-engineering to find (see [below](#under-the-hood)). If you've ever
-wondered *why* winetricks silently does nothing on your Proton prefix, or why
-Flathub randomly throws `GPG verification enabled, but no summary found` —
-you'll want to read that section.
+replicates Heroic's on-disk prefix layout byte-for-byte, retargets games
+stuck on a launcher that hangs forever under Wine, and works around
+seventeen separate real-world Wine/Winetricks/Flatpak/Heroic bugs it took
+actual reverse-engineering to find (see [below](#under-the-hood)). If you've
+ever wondered *why* winetricks silently does nothing on your Proton prefix,
+why Flathub randomly throws `GPG verification enabled, but no summary
+found`, or why a game starts and then instantly crashes with zero useful
+output anywhere — you'll want to read that section.
 
 It's built to be the companion the [Heroic Games
 Launcher](https://heroicgameslauncher.com/) doesn't ship with: a CLI that
-knows what's installed, what's ready, and what to run next.
+knows what's installed, what's ready, what's broken and *why*, and what to
+run next.
+
+**Battle-tested against a real 52-game Heroic library** — took it from 0
+games verified to 36+ fully working, uncovering and fixing bugs at every
+layer of the stack: Heroic's own config sandboxing, Wine/Proton DLL
+mismatches, a broken GOG launcher shim, a leaking concurrency lock, and a
+missing 32-bit codec that made one game crash on the very first frame.
 
 ## What it does
 
 1. **System setup** — installs Wine, Winetricks, DOSBox, ScummVM, 32-bit
-   graphics/audio libraries, Flatpak/Flathub, Heroic/Lutris, ProtonUp-Qt, and
-   `cnc-ddraw` for the classic DirectDraw black-screen bug.
+   graphics/audio/**media** libraries (the 32-bit GStreamer plugins Wine's
+   DirectShow backend needs for FMV intros — see [finding
+   #17](#17-a-game-that-crashes-instantly-on-launch--missing-32-bit-media-codecs)),
+   Flatpak/Flathub, Heroic/Lutris, ProtonUp-Qt, and `cnc-ddraw` for the
+   classic DirectDraw black-screen bug.
 2. **Game registry & doctor** — scans your GOG install directory, cross
-   references Heroic's own config to find each game's real Wine/Proton
-   prefix, classifies each game's runtime (Wine vs. native DOSBox/ScummVM),
-   and tells you exactly what's ready and what isn't.
+   references Heroic's own config (wherever it's actually installed — native,
+   Flatpak, or Snap) to find each game's real Wine/Proton prefix, classifies
+   each game's runtime (Wine, native DOSBox/ScummVM, or an old-style native
+   Linux installer), and tells you exactly what's ready and what isn't.
 3. **Autonomous patching** — creates missing Wine prefixes from scratch using
-   the *exact* Proton build Heroic already picked, then installs missing
-   redistributables into them. No manual `winecfg` fiddling.
-
-Run against a real 52-game Heroic library, it took games from "haven't been
-launched once" to fully verified and dependency-complete without touching
-Heroic itself.
+   the *exact* Proton build Heroic already picked, installs missing
+   redistributables into them, retargets games stuck on a launcher shim known
+   to hang forever under Wine, and applies confirmed per-game compatibility
+   shims. No manual `winecfg` fiddling.
+4. **Crash diagnosis** — `diagnose` reads Heroic's own launch logs, recognizes
+   common Wine crash signatures (missing media codecs, DXVK/VKD3D, missing
+   C++ redistributables), and explains the *likely cause* in plain language
+   instead of a wall of `fixme:` spam.
 
 ## Quick start
 
@@ -44,8 +61,12 @@ chmod +x gog-setup.sh
 # See what's ready and what isn't, with next-step suggestions
 ./gog-setup.sh list
 
-# Auto-create missing Wine prefixes and install missing dependencies
+# Auto-create missing Wine prefixes, install missing dependencies, and
+# apply confirmed per-game fixes (broken launchers, DirectDraw shims, ...)
 ./gog-setup.sh patch
+
+# A game crashed or won't start? Ask it why.
+./gog-setup.sh diagnose --only "Some Game"
 ```
 
 ## Commands
@@ -59,6 +80,7 @@ chmod +x gog-setup.sh
 | `patch`  | Scan, auto-create missing Wine prefixes, install missing dependencies, then list |
 | `list`   | Print the current game registry with a colorized ready/status table + progress bar |
 | `doctor` | Scan + verify + list, without touching system packages |
+| `diagnose` | Inspect Heroic's own launch logs for Wine-level crashes and explain them in plain language |
 | `logs`   | Show the last 200 lines of the companion log |
 | `help`   | Show usage |
 
@@ -68,9 +90,9 @@ chmod +x gog-setup.sh
 |--------|-------------|
 | `-d, --games-dir <path>` | Games directory to scan (default: `~/Games/Heroic`) |
 | `-c, --heroic-config-dir <path>` | Heroic config dir (default: auto-detected — see [below](#heroic-config-auto-detection)) |
-| `--only <name-or-id>` | Limit `scan`/`verify`/`patch`/`doctor` to one game (case-insensitive name substring or exact GOG id) — handy for iterating on a single broken game |
+| `--only <name-or-id>` | Limit `scan`/`verify`/`patch`/`doctor`/`diagnose` to one game (case-insensitive name substring or exact GOG id) — handy for iterating on a single broken game |
 | `-y, --yes` | Non-interactive mode (assume yes / pick sensible defaults) |
-| `-f, --fix` | Auto-install missing Winetricks components during `verify` |
+| `-f, --fix` | Auto-install missing Winetricks components, and apply confirmed per-game fixes, during `verify` |
 | `-h, --help` | Show usage |
 
 ## Heroic config auto-detection
@@ -101,11 +123,16 @@ flowchart LR
     B["goggame-&lt;id&gt;.info"] -->|name + primary exe| D
     C["GamesConfig/&lt;id&gt;.json"] -->|Wine prefix + Proton build| D
     D --> E{engine?}
-    E -->|wine| F[check exe / prefix / winetricks verbs]
+    E -->|wine| F[check exe / prefix / winetricks verbs / known-broken launcher]
     E -->|dosbox or scummvm| G[check emulator installed + game data present]
+    E -->|native| N[check start.sh present + executable]
     F -->|patch| H[create prefix with Heroic's exact Proton build]
     H --> I[flatten compatdata layout to match Heroic]
     F -->|patch| J[install missing verbs via matching Wine build]
+    F -->|patch| K[retarget manifest past a broken launcher + apply confirmed shims]
+    L[Heroic launch.log] -->|diagnose| M{crash signature recognized?}
+    M -->|yes| P[plain-language cause + fix]
+    M -->|no| Q[point at the raw backtrace]
 ```
 
 Every game is classified by **engine**, detected from its manifest's primary
@@ -126,10 +153,49 @@ launch task:
   `start.sh` is present and executable — no Wine prefix and no system
   emulator package required.
 
+## Diagnosing a crash
+
+"It starts and then instantly crashes" is one of the least useful bug reports
+in existence, and also the most common one anyone will ever give you about a
+Wine game — because Heroic doesn't surface *why* in its own UI. It's all
+sitting right there in Heroic's launch log, in Wine's own crash backtrace,
+just not in a form anyone should have to read at 1am.
+
+```bash
+./gog-setup.sh diagnose --only "Worms Forts"
+```
+
+```
+→ Diagnosing: Worms Forts - Under Siege
+⚠   Last launch crashed inside Wine (quartz).
+→   Likely cause: Wine's DirectShow/media backend (FMV intro or cutscene
+    video). Almost always missing 32-bit GStreamer plugins - run
+    './gog-setup.sh setup' to install them.
+→   Full log: ~/.local/state/Heroic/logs/games/<id>_gog/launch.log
+```
+
+`diagnose` reads the *most recent* launch log Heroic itself wrote for a game,
+checks for `Unhandled exception` (a real Wine-level crash, not a silent
+hang like [Worms 2's broken launcher](#13-worms-2-was-still-unplayable-after-every-fix-above--goglauncherexe-itself-is-broken-under-wine)),
+and walks the crash backtrace looking for a module name it recognizes:
+
+| Crashing module | Likely cause |
+|---|---|
+| `winegstreamer` / `quartz` | FMV intro/cutscene. Missing 32-bit GStreamer plugins — or, if `setup` already installed those, a codec library the Proton build's *own bundled* plugins need but current Ubuntu no longer packages (`patch` applies a per-game fix for confirmed titles) |
+| `d3d9` / `d3d11` / `d3d12` | Missing redistributables, or try a different Proton/Wine-GE build |
+| `dxvk` | DXVK crashed — GPU driver, or disable DXVK for this game |
+| `vkd3d` | VKD3D crashed — try a different Proton build |
+| `msvcp*` / `msvcr<version>` / `ucrtbase` | Missing/corrupt C++ redistributable |
+| `xaudio*` / `xactengine*` | Missing XAudio2/XACT verbs |
+
+A game that's never been launched from Heroic gets a clear "no log found"
+instead of a false "all clear." A crash in an unrecognized module still gets
+pointed straight at the backtrace instead of a shrug.
+
 ## Under the hood
 
 This is the part that was actually fun. Getting `patch` to reliably work
-required reverse-engineering sixteen independent, undocumented failure modes:
+required reverse-engineering eighteen independent, undocumented failure modes:
 
 ### 1. Winetricks can't find `wineserver` on Debian/Ubuntu
 
@@ -368,6 +434,66 @@ and it has the useful side effect of making the fix self-idempotent: the
 next `scan` reads the already-corrected manifest and simply stops detecting
 a broken launcher at all, no separate "is this already fixed?" check needed.
 
+### 17. A game that crashes instantly on launch — missing 32-bit media codecs
+
+With its Wine prefix, dependencies, and executable all correct, Worms Forts:
+Under Siege still crashed the instant it launched — real CPU activity this
+time (not a hang), then gone. Heroic's `WINEDEBUG=+fixme` alone hid the
+actual cause; re-running with a full crash dump captured it: `wine:
+Unhandled page fault on write access ... in msvcrt`, with a backtrace one
+level up showing the real culprits — `quartz` (Wine's DirectShow pipeline)
+calling into `winegstreamer` (Wine's GStreamer-based media backend) right
+before the fault. The tell had been sitting in the log the whole time,
+scrolled past: hundreds of lines of `GStreamer-WARNING: Failed to load
+plugin ... wrong ELF class: ELFCLASS64` — every single bundled GStreamer
+plugin on the system is 64-bit, and this is a 32-bit WoW64 Wine process that
+can't load any of them at all. With zero working plugins, `winegstreamer`
+doesn't fail gracefully on the game's intro video — it segfaults. Fix:
+`setup` now also installs the `:i386` GStreamer plugin packages (`base`,
+`good`, `bad`, `ugly`, `libav`) Ubuntu doesn't pull in by default, and
+`verify`/`doctor` warn once, system-wide, if they're still missing — the same
+fix applies to *any* game with a DirectShow FMV intro, not just this one, so
+it's checked independently of any single game's dependency list. The new
+`diagnose` command (see [above](#diagnosing-a-crash)) turns the specific
+`grep -A20 "Backtrace:"` investigation that found this into a permanent,
+reusable capability instead of a one-off debugging session.
+
+### 18. The GStreamer fix (#17) wasn't the whole story — Proton's own bundled plugins were the real problem
+
+Installing the 32-bit GStreamer packages fixed the `ELFCLASS64` warnings for
+*those* plugins, but Worms Forts: Under Siege still crashed identically
+afterward, same faulting address and everything. Re-running with
+`GST_DEBUG=3` showed why: `quartz` doesn't use the system's GStreamer install
+at all here — it's loading `winegstreamer`'s plugins from *Proton's own
+bundled* `files/lib/i386-linux-gnu/gstreamer-1.0/`, and Proton's own launch
+script sets `GST_PLUGIN_SYSTEM_PATH_1_0` with a plain assignment
+(`self.env["GST_PLUGIN_SYSTEM_PATH_1_0"] = ...`), not an append — so it
+unconditionally overwrites anything already in the environment, meaning
+there was never a way to point it at the system's (correctly working) i386
+plugins from outside Proton's own launch code at all. Digging into *why*
+Proton's own bundled plugin failed anyway: `libgstlibav.so` (the actual MPEG
+decoder, needed for this game's `.mpg` FMVs) requires `libvpx.so.9` and
+`libgsttheora.so` requires `libtheoradec.so.1` — sonames Ubuntu 26.04 no
+longer packages at all, having moved to incompatible `.so.12`/`.so.2`
+versions. This specific Proton build (`Proton-CachyOS-latest`, which
+self-identifies as "a testing version containing experimental patches") was
+built against codec library versions that no longer exist in current Ubuntu
+repos, and no `apt install` can conjure a soname the archive doesn't carry.
+
+The pragmatic fix, and the same one many GOG games of this era expose as an
+in-game "skip intro" setting that this one doesn't: move the video files
+themselves out of the way, so DirectShow has nothing to open and the crash
+path is never entered at all. Confirmed by testing in stages — moved the
+`.mpg` files aside manually first (crash gone, real fullscreen window,
+stable for 25+ seconds of active gameplay-level CPU use), restored them, then
+had `patch` do the same move itself before re-confirming clean from a
+genuinely fresh state. Fix: `DISABLE_FMV_GLOB`, the same confirmed-only,
+GOG-id-keyed pattern as `NEEDS_CNC_DDRAW` and `KNOWN_BROKEN_LAUNCHERS`, moves
+a game's crash-triggering video files into a same-directory
+`gog-companion-disabled` backup folder — reversible, and easy to restore if
+a future Proton/Wine-GE build ever ships codec libraries this game actually
+needs.
+
 ## How the registry is built
 
 `scan` writes `~/.config/gog-companion/registry.json`, one entry per game,
@@ -409,6 +535,10 @@ with `./gog-setup.sh logs`.
 - Prefix auto-creation only works for Proton runners (which is what every
   Heroic-managed GOG install currently uses). A game configured with plain
   Wine falls back to "launch it once in Heroic" guidance.
+- `diagnose` only sees crashes with an `Unhandled exception` in Wine's own
+  log — a silent hang with no crash at all (like Worms 2's broken launcher
+  before it was fixed) won't show up there; check for a live-but-idle
+  process instead.
 
 ## Roadmap
 
@@ -416,18 +546,25 @@ Ideas worth doing next, roughly in order of "would make this more magical":
 
 - [x] ~~**Concurrency lock**~~ — done: `flock` on `~/.config/gog-companion/companion.lock`,
       held for the process's lifetime; `scan`/`verify`/`patch`/`doctor`/`all`
-      refuse to run twice at once instead of racing.
+      refuse to run twice at once instead of racing, and every wine/winetricks
+      subprocess now closes its copy of the lock fd so a leaked child can't
+      pin it after the script itself has exited (finding #15).
 - [ ] **Plain-Wine runner support** — extend `init_wine_prefix` beyond
       Proton (`wine`/`wineboot` directly) for non-Proton Heroic configs.
-- [x] ~~**Per-game verb overrides**~~ — partially done: `NEEDS_CNC_DDRAW` and
-      `KNOWN_BROKEN_LAUNCHERS` are the same idea (a GOG-id/exe-name-keyed
-      table of confirmed per-game fixes) applied to the DirectDraw shim and
-      broken-launcher override rather than Winetricks verbs specifically.
-      Extending the same pattern to extra verbs (`dxvk`, `d3dcompiler_47`,
-      `faudio`) — possibly seeded from [ProtonDB](https://www.protondb.com/)
-      or Heroic's own `protonfixes`/`ProtonFixesRoot` — is still open.
+- [x] ~~**Per-game verb overrides**~~ — partially done: `NEEDS_CNC_DDRAW`,
+      `KNOWN_BROKEN_LAUNCHERS`, and `DISABLE_FMV_GLOB` are all the same idea
+      (a GOG-id/exe-name-keyed table of confirmed per-game fixes) applied to
+      the DirectDraw shim, broken-launcher override, and crash-triggering
+      FMVs respectively, rather than Winetricks verbs specifically. Extending
+      the same pattern to extra verbs (`dxvk`, `d3dcompiler_47`, `faudio`) —
+      possibly seeded from [ProtonDB](https://www.protondb.com/) or Heroic's
+      own `protonfixes`/`ProtonFixesRoot` — is still open.
 - [x] ~~**`--only <game>` filter**~~ — done: `--only <name-or-id>` limits
-      `scan`/`verify`/`patch`/`doctor` to a single game.
+      `scan`/`verify`/`patch`/`doctor`/`diagnose` to a single game.
+- [x] ~~**Crash diagnosis**~~ — done: `diagnose` reads Heroic's own launch
+      logs and recognizes common Wine crash signatures (see [Diagnosing a
+      crash](#diagnosing-a-crash)). Open extension: recognize more module
+      patterns as they're found, the same way the per-game fix tables grow.
 - [ ] **Parallel patching** — process independent prefixes concurrently
       (bounded by CPU/network) instead of strictly serial.
 - [ ] **JSON/`--quiet` output mode** — machine-readable `list` output for
@@ -440,13 +577,12 @@ Ideas worth doing next, roughly in order of "would make this more magical":
       regressions like the ones documented above get caught automatically.
 - [ ] **Health-check command for Heroic itself** — detect a broken Heroic
       install/config (corrupt `GamesConfig`, missing Proton builds) and
-      offer to repair it, the same way `setup` repairs Flathub.
+      offer to repair it, the same way `setup` repairs Flathub. `diagnose`
+      covers per-game crash triage; this would be the whole-install version.
 
-Contributions, bug reports, and "I found a fourth undocumented Wine/Proton
+Contributions, bug reports, and "I found the next undocumented Wine/Proton
 gotcha" reports are all welcome.
 
 ## License
 
 MIT
-
-# gog-setup-wizard
