@@ -25,16 +25,63 @@ GRAY='\033[0;90m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# Heroic's config normally lives at ~/.config/heroic, but the two other common
+# install methods sandbox it elsewhere: Flatpak (the default this script's own
+# `setup` installs) redirects $HOME for the app, and Snap does the same under
+# ~/snap. Guessing the wrong one means every single Wine-engine game reports
+# an empty prefix/runner forever - not a per-game issue, a total one - so this
+# is resolved once, up front, by checking all three and preferring whichever
+# actually has Heroic's GOG install list.
+detect_heroic_config_dir() {
+    local candidates=(
+        "$HOME/.config/heroic"
+        "$HOME/.var/app/com.heroicgameslauncher.hgl/config/heroic"
+        "$HOME/snap/heroic/current/.config/heroic"
+    ) c best="" best_mtime=-1 mtime marker
+
+    for c in "${candidates[@]}"; do
+        marker="$c/gog_store/installed.json"
+        [ -f "$marker" ] || continue
+        # Prefer whichever install has been touched most recently, in case
+        # more than one is present (e.g. after switching install methods).
+        mtime=$(stat -c '%Y' "$marker" 2>/dev/null || echo 0)
+        if [ "$mtime" -gt "$best_mtime" ]; then
+            best="$c"
+            best_mtime="$mtime"
+        fi
+    done
+
+    # Nothing found yet (e.g. Heroic installed but never opened / no GOG
+    # games added): fall back to the native path so error messages downstream
+    # point somewhere sensible instead of an arbitrary sandbox path.
+    echo "${best:-${candidates[0]}}"
+}
+
 # --- Game Registry / Companion Settings ---
 GAMES_DIR="${GOG_GAMES_DIR:-$HOME/Games/Heroic}"
 CONFIG_DIR="$HOME/.config/gog-companion"
 REGISTRY_FILE="$CONFIG_DIR/registry.json"
 LOG_FILE="$CONFIG_DIR/gog-companion.log"
 STEAM_FAKE_CLIENT_DIR="$CONFIG_DIR/fake-steam-client"
-HEROIC_GAMES_CONFIG_DIR="$HOME/.config/heroic/GamesConfig"
-HEROIC_INSTALLED_FILE="$HOME/.config/heroic/gog_store/installed.json"
+HEROIC_CONFIG_DIR="${GOG_HEROIC_CONFIG_DIR:-$(detect_heroic_config_dir)}"
+HEROIC_GAMES_CONFIG_DIR="$HEROIC_CONFIG_DIR/GamesConfig"
+HEROIC_INSTALLED_FILE="$HEROIC_CONFIG_DIR/gog_store/installed.json"
 LOCK_FILE="$CONFIG_DIR/companion.lock"
+CNC_DDRAW_DIR="$HOME/GOG_Fixes/cnc-ddraw"
 COMMAND="all"
+ONLY_FILTER=""
+
+# Games (by GOG id) confirmed during development to render nothing but a
+# black screen / no window at all without the cnc-ddraw shim, even once
+# their prefix, dependencies and launch target are otherwise correct -
+# Worms 2's own primary executable (once GOGLauncher.exe is bypassed) is a
+# classic DirectDraw app that Wine's DirectDraw implementation can't drive
+# on its own. Deliberately a short, explicit, confirmed-only list rather
+# than something inferred - forcing this shim onto a game that renders fine
+# without it can just as easily break it.
+declare -A NEEDS_CNC_DDRAW=(
+    [1207659104]=1   # Worms 2
+)
 
 # Every log_* call is echoed to the console (colored) and appended to
 # LOG_FILE (plain, timestamped) so runs can be reviewed after the fact.
@@ -286,22 +333,38 @@ install_protonup() {
 }
 
 download_retro_fixes() {
-    FIXES_DIR="$HOME/GOG_Fixes"
-    mkdir -p "$FIXES_DIR/cnc-ddraw"
+    mkdir -p "$CNC_DDRAW_DIR"
     log_info "Downloading latest cnc-ddraw (Fixes retro 2D/DirectDraw games like Worms 2)..."
-    
+
     # Get latest release of cnc-ddraw from GitHub
     LATEST_CNC_URL=$(curl -s https://api.github.com/repos/FunkyFr3sh/cnc-ddraw/releases/latest | grep "browser_download_url.*cnc-ddraw.zip" | cut -d '"' -f 4)
-    
+
     if [ -n "$LATEST_CNC_URL" ]; then
-        curl -sL "$LATEST_CNC_URL" -o "$FIXES_DIR/cnc-ddraw/cnc-ddraw.zip"
-        unzip -o -q "$FIXES_DIR/cnc-ddraw/cnc-ddraw.zip" -d "$FIXES_DIR/cnc-ddraw/"
-        rm "$FIXES_DIR/cnc-ddraw/cnc-ddraw.zip"
-        log_success "cnc-ddraw downloaded to: $FIXES_DIR/cnc-ddraw/"
-        echo -e "   ${YELLOW}Tip:${NC} Copy 'ddraw.dll' and 'ddraw.ini' into any 90s DirectX/DirectDraw game folder if you experience black screens."
+        curl -sL "$LATEST_CNC_URL" -o "$CNC_DDRAW_DIR/cnc-ddraw.zip"
+        unzip -o -q "$CNC_DDRAW_DIR/cnc-ddraw.zip" -d "$CNC_DDRAW_DIR/"
+        rm "$CNC_DDRAW_DIR/cnc-ddraw.zip"
+        log_success "cnc-ddraw downloaded to: $CNC_DDRAW_DIR/"
+        echo -e "   ${YELLOW}Tip:${NC} '$SCRIPT_NAME patch' applies this automatically to games confirmed to need it (like Worms 2)."
     else
         log_warn "Could not fetch cnc-ddraw automatically. Download manually from: https://github.com/FunkyFr3sh/cnc-ddraw/releases"
     fi
+}
+
+# Copy the cnc-ddraw DirectDraw shim into a game's own folder, where Windows'
+# DLL search order picks it up ahead of any system one. Never overwrites a
+# ddraw.dll the game already ships (a handful bundle their own compat DLL).
+apply_ddraw_fix() {
+    local game_dir="$1"
+    if [ -f "$game_dir/ddraw.dll" ]; then
+        return 0
+    fi
+    if [ ! -f "$CNC_DDRAW_DIR/ddraw.dll" ]; then
+        log_warn "  This game needs the cnc-ddraw shim but it hasn't been downloaded yet; run '$SCRIPT_NAME setup' first."
+        return 1
+    fi
+    cp "$CNC_DDRAW_DIR/ddraw.dll" "$game_dir/ddraw.dll"
+    cp "$CNC_DDRAW_DIR/ddraw.ini" "$game_dir/ddraw.ini" 2>/dev/null || true
+    log_success "  Copied cnc-ddraw's ddraw.dll into the game folder (fixes black-screen/no-window DirectDraw titles)."
 }
 
 run_system_setup() {
@@ -402,10 +465,16 @@ init_wine_prefix() {
     mkdir -p "$prefix" "$STEAM_FAKE_CLIENT_DIR"
     log_info "  Creating Wine prefix with $(basename "$(dirname "$proton_bin")") (this can take a moment)..."
 
+    # 200>&- closes this process's copy of the companion lock fd before wine
+    # forks its long-lived service tree (services.exe, winedevice.exe, ...).
+    # Without it, any of those survive well past this script exiting - the
+    # flock is tied to the open file description, not our PID, so a single
+    # leaked child keeps every future scan/verify/patch/doctor refusing to
+    # start with "another instance is already running" forever after.
     if ! timeout 180 bash -c '
         echo "----- init_wine_prefix: $1 ($(date "+%Y-%m-%d %H:%M:%S")) -----"
         STEAM_COMPAT_DATA_PATH="$1" STEAM_COMPAT_CLIENT_INSTALL_PATH="$2" "$3" run wineboot --init
-    ' _ "$prefix" "$STEAM_FAKE_CLIENT_DIR" "$proton_bin" >> "$LOG_FILE" 2>&1; then
+    ' _ "$prefix" "$STEAM_FAKE_CLIENT_DIR" "$proton_bin" >> "$LOG_FILE" 2>&1 200>&-; then
         log_warn "  Prefix creation failed or timed out; see $LOG_FILE for details."
     fi
 
@@ -413,7 +482,7 @@ init_wine_prefix() {
     # wineboot; kill it now so later tools (winetricks) don't hang waiting on it.
     proton_wineserver="$(dirname "$proton_bin")/files/bin/wineserver"
     if [ -x "$proton_wineserver" ]; then
-        timeout 15 env WINEPREFIX="$prefix" "$proton_wineserver" -k >> "$LOG_FILE" 2>&1 || true
+        timeout 15 env WINEPREFIX="$prefix" "$proton_wineserver" -k >> "$LOG_FILE" 2>&1 200>&- || true
     fi
 
     if [ -d "$prefix/pfx" ] && [ ! -L "$prefix/pfx" ]; then
@@ -432,15 +501,16 @@ init_wine_prefix() {
 
 # Insert or update a single registry entry, keyed by game id.
 upsert_registry_entry() {
-    local id="$1" name="$2" path="$3" info_file="$4" exe="$5" prefix="$6" runner="$7" engine="$8" wrapper="$9"
+    local id="$1" name="$2" path="$3" info_file="$4" exe="$5" prefix="$6" runner="$7" engine="$8" wrapper="$9" launcher_override="${10}"
     local now tmp new_entry
     now=$(date -Iseconds)
     new_entry=$(jq -n \
         --arg id "$id" --arg name "$name" --arg path "$path" \
         --arg info_file "$info_file" --arg exe "$exe" --arg prefix "$prefix" --arg runner "$runner" \
-        --arg engine "$engine" --argjson wrapper "$wrapper" --arg now "$now" \
+        --arg engine "$engine" --argjson wrapper "$wrapper" --arg now "$now" --arg launcher_override "$launcher_override" \
         '{id:$id, name:$name, path:$path, info_file:$info_file, executable:$exe,
           wine_prefix:$prefix, runner:$runner, engine:$engine, wrapper_present:$wrapper,
+          launcher_override:$launcher_override,
           status:"unverified", missing_dependencies:[],
           last_scanned:$now, last_verified:null}')
 
@@ -449,6 +519,80 @@ upsert_registry_entry() {
         '(map(.id) | index($entry.id)) as $idx
          | if $idx != null then .[$idx] = (.[$idx] * $entry) else . + [$entry] end' \
         "$REGISTRY_FILE" > "$tmp" && mv "$tmp" "$REGISTRY_FILE"
+}
+
+# GOGLauncher.exe is GOG's own generic first-run shim, bundled with many
+# older Windows game installs (Worms 2 among them). It plays a sequence of
+# intro movies via ShellExecute before handing off to the game's real menu;
+# under Wine that ShellExecute call never resolves to anything (no
+# registered .wmv handler) and hangs forever with no window and no error -
+# confirmed by tracing a hung launch down to wine's start.exe being invoked
+# with a mangled "movie1.wmv#movie2.wmv#...#frontend.exe" argument it can
+# never open. Community-documented workaround: point the launcher straight
+# at the real executable instead of GOGLauncher.exe.
+KNOWN_BROKEN_LAUNCHERS=(goglauncher.exe)
+
+is_known_broken_launcher() {
+    local base_lc l
+    base_lc="$(basename "${1:-}")"
+    base_lc="${base_lc,,}"
+    for l in "${KNOWN_BROKEN_LAUNCHERS[@]}"; do
+        [ "$base_lc" = "$l" ] && return 0
+    done
+    return 1
+}
+
+# Best-effort replacement target when a known-broken launcher is detected.
+# frontend.exe is the de-facto GOG convention for the "real" menu
+# GOGLauncher.exe hands off to once its intro sequence finishes - and is
+# literally the tail end of the mangled argument that hangs under Wine.
+find_launcher_override() {
+    local game_dir="$1"
+    find "$game_dir" -maxdepth 1 -iname "frontend.exe" -print -quit 2>/dev/null || true
+}
+
+# Writing Heroic's per-game "targetExe" override (its "Change Target Exe"
+# advanced setting) is NOT durable on its own: Heroic keeps its own in-memory
+# copy of every game's settings for as long as it's running, and rewrites
+# the whole per-game config file - from that memory, not from disk - on
+# ordinary activity like launching the game. An already-running Heroic never
+# loaded our externally-written value, so the very next launch attempt
+# silently clobbers it back to empty. Confirmed live: set targetExe, watched
+# Heroic's own launch immediately revert it to null and hang on
+# GOGLauncher.exe again exactly as before.
+#
+# The durable fix is the manifest itself: gogdl resolves the primary
+# executable from goggame-<id>.info's playTasks fresh at launch time whenever
+# no override is active (installed.json's own "executable" field is blank,
+# confirming Heroic/gogdl don't cache a resolved path elsewhere) - so editing
+# the manifest's primary FileTask takes effect independent of whatever
+# Heroic happens to have in memory. The GamesConfig write is kept as a
+# harmless secondary attempt (it does work if the user opens Heroic's
+# settings and re-saves), but the manifest edit is what actually matters.
+apply_launcher_override() {
+    local id="$1" info_file="$2" override_path="$3" cfg="$HEROIC_GAMES_CONFIG_DIR/$id.json" existing tmp rel_exe
+
+    if [ -z "$info_file" ] || [ ! -f "$info_file" ]; then
+        log_warn "  No manifest found for this game; can't retarget its launch task."
+        return 1
+    fi
+    rel_exe="$(basename "$override_path")"
+
+    [ -f "$info_file.orig" ] || cp "$info_file" "$info_file.orig"
+
+    tmp=$(mktemp)
+    jq --arg exe "$rel_exe" \
+        '(.playTasks[]? | select(.isPrimary==true)) |= (.path = $exe | .arguments = "")' \
+        "$info_file" > "$tmp" && mv "$tmp" "$info_file"
+    log_success "  Retargeted the game manifest's launch task to $rel_exe (original saved as $(basename "$info_file").orig)."
+
+    if [ -f "$cfg" ]; then
+        existing=$(jq -r --arg id "$id" '.[$id].targetExe // empty' "$cfg" 2>/dev/null || true)
+        if [ -z "$existing" ] || [ "$existing" = "$override_path" ]; then
+            tmp=$(mktemp)
+            jq --arg id "$id" --arg exe "$override_path" '.[$id].targetExe = $exe' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+        fi
+    fi
 }
 
 # Parse a goggame-<id>.info manifest, printing "name<TAB>raw_relative_path".
@@ -496,9 +640,20 @@ has_wrapper_dir() {
     fi
 }
 
+# Whether a game matches the active --only filter (case-insensitive
+# substring of its name, or an exact GOG id match). Always true if no
+# filter is set.
+matches_only_filter() {
+    local id="$1" name="$2"
+    [ -z "$ONLY_FILTER" ] && return 0
+    [ "$id" = "$ONLY_FILTER" ] && return 0
+    [[ "${name,,}" == *"${ONLY_FILTER,,}"* ]] && return 0
+    return 1
+}
+
 # Register a single game given its GOG id and install directory.
 process_game() {
-    local id="$1" game_dir="$2" info_file manifest name raw_exe exe_path prefix runner engine wrapper
+    local id="$1" game_dir="$2" info_file manifest name raw_exe exe_path prefix runner engine wrapper launcher_override=""
 
     info_file="$game_dir/goggame-$id.info"
     [ -f "$info_file" ] || info_file=$(find "$game_dir" -maxdepth 1 -iname "goggame-*.info" -print -quit 2>/dev/null || true)
@@ -512,14 +667,30 @@ process_game() {
         raw_exe=""
     fi
 
-    engine=$(detect_engine "$raw_exe")
-    exe_path=$(resolve_executable "$game_dir" "$raw_exe")
-    wrapper=$(has_wrapper_dir "$game_dir" "$engine")
+    matches_only_filter "$id" "$name" || return 0
+
+    if [ -z "$info_file" ] && [ -x "$game_dir/start.sh" ]; then
+        # Old-style native Linux GOG installer (pre-dates the goggame-*.info
+        # manifest convention): ships its own bundled DOSBox/ScummVM/game
+        # binaries and a start.sh launcher, no Wine involved at all. Without
+        # this check it falls through to the "wine" default below and gets
+        # misreported as missing an executable.
+        engine="native"
+        exe_path="$game_dir/start.sh"
+        wrapper="false"
+    else
+        engine=$(detect_engine "$raw_exe")
+        exe_path=$(resolve_executable "$game_dir" "$raw_exe")
+        wrapper=$(has_wrapper_dir "$game_dir" "$engine")
+        if [ "$engine" = "wine" ] && is_known_broken_launcher "$raw_exe"; then
+            launcher_override=$(find_launcher_override "$game_dir")
+        fi
+    fi
 
     IFS=$'\t' read -r prefix runner <<< "$(find_heroic_config "$id" "$name")"
 
     log_info "Found game: $name"
-    upsert_registry_entry "$id" "$name" "$game_dir" "$info_file" "$exe_path" "$prefix" "$runner" "$engine" "$wrapper"
+    upsert_registry_entry "$id" "$name" "$game_dir" "$info_file" "$exe_path" "$prefix" "$runner" "$engine" "$wrapper" "$launcher_override"
 }
 
 # Scan for games in two passes: Heroic's own installed.json (authoritative for
@@ -535,6 +706,14 @@ scan_games() {
     fi
 
     log_info "Scanning $games_dir for installed GOG games..."
+
+    if [ -f "$HEROIC_INSTALLED_FILE" ]; then
+        log_info "Using Heroic config: $HEROIC_CONFIG_DIR"
+    else
+        log_warn "No Heroic config found at $HEROIC_CONFIG_DIR (checked native, Flatpak and Snap paths)."
+        log_info "  Wine prefix/runner lookups need Heroic to have run at least once with a game added."
+        log_info "  If Heroic is installed somewhere unusual, point at it with: $SCRIPT_NAME --heroic-config-dir <path>"
+    fi
 
     if [ -f "$HEROIC_INSTALLED_FILE" ]; then
         while IFS=$'\t' read -r id install_path; do
@@ -593,14 +772,23 @@ verify_games() {
 
     i=0
     while [ "$i" -lt "$count" ]; do
-        local entry id name exe prefix engine wrapper status missing_json installed_list missing verb wine_bin wineserver_bin
+        local entry id name exe prefix engine wrapper status missing_json installed_list missing verb wine_bin wineserver_bin launcher_override game_dir info_file
         entry=$(jq -c ".[$i]" "$REGISTRY_FILE")
         id=$(echo "$entry" | jq -r '.id')
         name=$(echo "$entry" | jq -r '.name')
+
+        if ! matches_only_filter "$id" "$name"; then
+            i=$((i + 1))
+            continue
+        fi
+
         exe=$(echo "$entry" | jq -r '.executable')
         prefix=$(echo "$entry" | jq -r '.wine_prefix')
         engine=$(echo "$entry" | jq -r '.engine // "wine"')
         wrapper=$(echo "$entry" | jq -r '.wrapper_present // false')
+        launcher_override=$(echo "$entry" | jq -r '.launcher_override // empty')
+        game_dir=$(echo "$entry" | jq -r '.path // empty')
+        info_file=$(echo "$entry" | jq -r '.info_file // empty')
 
         log_info "Verifying: $name"
         status="ok"
@@ -609,16 +797,25 @@ verify_games() {
         if [ "$engine" != "wine" ]; then
             # DOSBox/ScummVM titles run through the emulators installed by
             # '$SCRIPT_NAME setup' and never touch Wine, so skip prefix/deps checks.
+            # "native" (old-style GOG .sh installers) ships its own bundled
+            # binaries and needs neither Wine nor a system emulator package.
             if [ -n "$exe" ] && [ "$exe" != "null" ] && [ -f "$exe" ]; then
-                log_success "  Native $engine title, launcher found."
+                if [ "$engine" = "native" ]; then
+                    log_success "  Native Linux installer, launcher found."
+                else
+                    log_success "  Native $engine title, launcher found."
+                fi
             elif [ "$wrapper" = "true" ]; then
                 log_warn "  Expected a $engine executable inside the game folder but couldn't find one."
+                status="missing_exe"
+            elif [ "$engine" = "native" ]; then
+                log_warn "  Expected 'start.sh' inside the game folder but couldn't find it (or it's not executable)."
                 status="missing_exe"
             else
                 log_success "  Native $engine title (Heroic runs this with its bundled $engine, no wrapper needed)."
             fi
 
-            if ! command -v "$engine" >/dev/null 2>&1 && ! command -v "${engine}-staging" >/dev/null 2>&1; then
+            if [ "$engine" != "native" ] && ! command -v "$engine" >/dev/null 2>&1 && ! command -v "${engine}-staging" >/dev/null 2>&1; then
                 log_warn "  '$engine' does not appear to be installed. Run '$SCRIPT_NAME setup'."
                 [ "$status" = "ok" ] && status="needs_deps"
             fi
@@ -635,6 +832,33 @@ verify_games() {
         if [ -z "$exe" ] || [ "$exe" = "null" ] || [ ! -f "$exe" ]; then
             log_warn "  Executable not found: ${exe:-<none>}"
             status="missing_exe"
+        fi
+
+        if [ -n "$launcher_override" ] && [ "$launcher_override" != "null" ]; then
+            # Not idempotency-checked here on purpose: apply_launcher_override
+            # edits the manifest's primary path directly, so the *next* scan
+            # reads the corrected manifest and simply stops detecting a
+            # broken launcher at all - no separate "already fixed" check needed.
+            log_warn "  Primary launcher ($(basename "$exe")) is known to hang under Wine/Proton (see README 'Under the hood')."
+            if [ "$AUTO_FIX" = true ] && apply_launcher_override "$id" "$info_file" "$launcher_override"; then
+                exe="$launcher_override"
+            else
+                if [ "$AUTO_FIX" != true ]; then
+                    log_info "  A working alternative was found: $launcher_override"
+                    log_info "  Tip: run '$SCRIPT_NAME patch' to retarget the game's launch task automatically."
+                fi
+                status="broken_launcher"
+            fi
+        fi
+
+        if [ -n "${NEEDS_CNC_DDRAW[$id]:-}" ] && [ -n "$game_dir" ] && [ ! -f "$game_dir/ddraw.dll" ]; then
+            log_warn "  This title needs the cnc-ddraw shim to render (confirmed black-screen/no-window without it)."
+            if [ "$AUTO_FIX" = true ] && apply_ddraw_fix "$game_dir"; then
+                :
+            else
+                [ "$AUTO_FIX" != true ] && log_info "  Tip: run '$SCRIPT_NAME patch' to copy it in automatically."
+                [ "$status" = "ok" ] && status="needs_deps"
+            fi
         fi
 
         if [ -z "$prefix" ] || [ "$prefix" = "null" ]; then
@@ -661,7 +885,10 @@ verify_games() {
             env_args=(WINEPREFIX="$prefix" WINESERVER="$wineserver_bin")
             [ -n "$wine_bin" ] && env_args+=(WINE="$wine_bin")
 
-            installed_list=$(timeout 60 env "${env_args[@]}" winetricks list-installed 2>/dev/null || true)
+            # 200>&- - see the matching comment in init_wine_prefix: without
+            # it, any wine process winetricks spawns here can outlive this
+            # script and keep the companion lock held forever.
+            installed_list=$(timeout 60 env "${env_args[@]}" winetricks list-installed 2>/dev/null 200>&- || true)
             missing=()
             for verb in "${WANTED_VERBS[@]}"; do
                 # A prefix patched before vcrun2015 was dropped from WANTED_VERBS
@@ -695,13 +922,17 @@ verify_games() {
                             # that specific check with --force rather than giving up.
                             local force_flag=""
                             [ "$attempt" -eq 3 ] && force_flag="--force"
+                            # 200>&- - see init_wine_prefix; vc_redist.x86.exe in
+                            # particular relaunches itself as a separate elevated
+                            # helper process that can keep running well after this
+                            # returns, which would otherwise pin the companion lock.
                             if timeout 300 bash -c '
                                 verb="$1"; wp="$2"; ws="$3"; wb="$4"; force="$6"
                                 echo "----- winetricks $verb -> $wp (wine=${wb:-system}, attempt $5${force:+, forced}) -----"
                                 args=(WINEPREFIX="$wp" WINESERVER="$ws")
                                 [ -n "$wb" ] && args+=(WINE="$wb")
                                 env "${args[@]}" winetricks -q ${force} "$verb"
-                            ' _ "$verb" "$prefix" "$wineserver_bin" "$wine_bin" "$attempt" "$force_flag" >> "$LOG_FILE" 2>&1; then
+                            ' _ "$verb" "$prefix" "$wineserver_bin" "$wine_bin" "$attempt" "$force_flag" >> "$LOG_FILE" 2>&1 200>&-; then
                                 ok=true
                                 break
                             fi
@@ -730,7 +961,7 @@ verify_games() {
             # every call - killing wineserver mid-sequence forces repeated cold
             # starts, and wineserver's startup banner races with winetricks'
             # internal %AppData% detection, causing intermittent verb failures.
-            [ -n "$wineserver_bin" ] && timeout 15 env WINEPREFIX="$prefix" "$wineserver_bin" -k >> "$LOG_FILE" 2>&1 || true
+            [ -n "$wineserver_bin" ] && timeout 15 env WINEPREFIX="$prefix" "$wineserver_bin" -k >> "$LOG_FILE" 2>&1 200>&- || true
         fi
 
         local tmp
@@ -758,7 +989,9 @@ list_games() {
     hr "$GRAY"
 
     jq -r '.[] | [.name, (if .status=="ok" then "YES" else "no" end), .status,
-                  (if .engine=="wine" then (.runner // "unknown") else (.engine // "unknown") + " (native)" end),
+                  (if .engine=="wine" then (.runner // "unknown")
+                   elif .engine=="native" then "native (shell script)"
+                   else (.engine // "unknown") + " (native)" end),
                   (if .engine=="wine" then (.wine_prefix // "unknown") else "n/a" end)] | @tsv' "$REGISTRY_FILE" |
         while IFS=$'\t' read -r n r s rn p; do
             local rcolor scolor prefix_w=42
@@ -768,7 +1001,7 @@ list_games() {
             case "$s" in
                 ok) scolor="$GREEN" ;;
                 needs_deps) scolor="$YELLOW" ;;
-                missing_exe|missing_prefix) scolor="$RED" ;;
+                missing_exe|missing_prefix|broken_launcher) scolor="$RED" ;;
                 *) scolor="$GRAY" ;;
             esac
             printf "%-${name_w}s ${rcolor}%-${ready_w}s${NC} ${scolor}%-${status_w}s${NC} ${GRAY}%-${runner_w}s %s${NC}\n" \
@@ -777,11 +1010,12 @@ list_games() {
 
     total=$(jq 'length' "$REGISTRY_FILE")
     ready=$(jq '[.[] | select(.status=="ok")] | length' "$REGISTRY_FILE")
-    local needs_deps missing_prefix missing_exe other bar_w=30 filled bar pct
+    local needs_deps missing_prefix missing_exe broken_launcher other bar_w=30 filled bar pct
     needs_deps=$(jq '[.[] | select(.status=="needs_deps")] | length' "$REGISTRY_FILE")
     missing_prefix=$(jq '[.[] | select(.status=="missing_prefix")] | length' "$REGISTRY_FILE")
     missing_exe=$(jq '[.[] | select(.status=="missing_exe")] | length' "$REGISTRY_FILE")
-    other=$((total - ready - needs_deps - missing_prefix - missing_exe))
+    broken_launcher=$(jq '[.[] | select(.status=="broken_launcher")] | length' "$REGISTRY_FILE")
+    other=$((total - ready - needs_deps - missing_prefix - missing_exe - broken_launcher))
 
     pct=0; filled=0
     if [ "$total" -gt 0 ]; then
@@ -802,6 +1036,7 @@ list_games() {
         [ "$needs_deps" -gt 0 ] && echo -e "  ${YELLOW}•${NC} $needs_deps game(s) just need missing dependencies installed → run ${BOLD}$SCRIPT_NAME patch${NC}"
         [ "$missing_prefix" -gt 0 ] && echo -e "  ${YELLOW}•${NC} $missing_prefix game(s) need a Wine prefix created → run ${BOLD}$SCRIPT_NAME patch${NC} (or launch once in Heroic)"
         [ "$missing_exe" -gt 0 ] && echo -e "  ${RED}•${NC} $missing_exe game(s) are missing their executable → check the install in Heroic"
+        [ "$broken_launcher" -gt 0 ] && echo -e "  ${RED}•${NC} $broken_launcher game(s) use a launcher known to hang under Wine → run ${BOLD}$SCRIPT_NAME patch${NC} to point Heroic at a working executable"
         [ "$other" -gt 0 ] && echo -e "  ${GRAY}•${NC} $other game(s) haven't been verified yet → run ${BOLD}$SCRIPT_NAME verify${NC}"
     fi
     echo ""
@@ -824,10 +1059,12 @@ ${BOLD}${CYAN}Commands:${NC}
   ${GREEN}help${NC}        Show this help message
 
 ${BOLD}${CYAN}Options:${NC}
-  ${YELLOW}-d, --games-dir <path>${NC}   Games directory to scan (default: $GAMES_DIR)
-  ${YELLOW}-y, --yes${NC}                Non-interactive mode (assume yes / pick defaults)
-  ${YELLOW}-f, --fix${NC}                Auto-install missing Winetricks components during verify
-  ${YELLOW}-h, --help${NC}               Show this help message
+  ${YELLOW}-d, --games-dir <path>${NC}          Games directory to scan (default: $GAMES_DIR)
+  ${YELLOW}-c, --heroic-config-dir <path>${NC}  Heroic config dir (default: auto-detected; currently $HEROIC_CONFIG_DIR)
+  ${YELLOW}--only <name-or-id>${NC}             Limit scan/verify/patch/doctor to one game (name substring or GOG id)
+  ${YELLOW}-y, --yes${NC}                       Non-interactive mode (assume yes / pick defaults)
+  ${YELLOW}-f, --fix${NC}                       Auto-install missing Winetricks components during verify
+  ${YELLOW}-h, --help${NC}                      Show this help message
 EOF
 )
     echo -e "$text"
@@ -840,6 +1077,13 @@ main() {
                 COMMAND="$1"; shift ;;
             -d|--games-dir)
                 GAMES_DIR="$2"; shift 2 ;;
+            -c|--heroic-config-dir)
+                HEROIC_CONFIG_DIR="$2"
+                HEROIC_GAMES_CONFIG_DIR="$HEROIC_CONFIG_DIR/GamesConfig"
+                HEROIC_INSTALLED_FILE="$HEROIC_CONFIG_DIR/gog_store/installed.json"
+                shift 2 ;;
+            --only)
+                ONLY_FILTER="$2"; shift 2 ;;
             -y|--yes)
                 ASSUME_YES=true; shift ;;
             -f|--fix)

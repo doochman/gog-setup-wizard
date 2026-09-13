@@ -67,9 +67,31 @@ chmod +x gog-setup.sh
 | Option | Description |
 |--------|-------------|
 | `-d, --games-dir <path>` | Games directory to scan (default: `~/Games/Heroic`) |
+| `-c, --heroic-config-dir <path>` | Heroic config dir (default: auto-detected — see [below](#heroic-config-auto-detection)) |
+| `--only <name-or-id>` | Limit `scan`/`verify`/`patch`/`doctor` to one game (case-insensitive name substring or exact GOG id) — handy for iterating on a single broken game |
 | `-y, --yes` | Non-interactive mode (assume yes / pick sensible defaults) |
 | `-f, --fix` | Auto-install missing Winetricks components during `verify` |
 | `-h, --help` | Show usage |
+
+## Heroic config auto-detection
+
+Heroic can be installed three different ways on Ubuntu, and each one puts its
+config in a different place:
+
+- **Native / AppImage** — `~/.config/heroic`
+- **Flatpak** (what `setup` installs by default, and the most common way to
+  get Heroic on Ubuntu) — `~/.var/app/com.heroicgameslauncher.hgl/config/heroic`
+- **Snap** — `~/snap/heroic/current/.config/heroic`
+
+Every `wine_prefix`/`runner` lookup depends on reading the *right* one of
+these. Get it wrong and it's not a per-game glitch — **every** Wine-engine
+game in your library reports `unknown_prefix` forever, since the script never
+finds the Wine prefix or Proton build Heroic actually configured for any of
+them. The script checks all three on every run and uses whichever one
+actually has Heroic's GOG install list (preferring the most recently modified
+if more than one is present), so this should just work — but if Heroic is
+installed somewhere non-standard, override it with `-c/--heroic-config-dir`
+or the `GOG_HEROIC_CONFIG_DIR` environment variable.
 
 ## Architecture
 
@@ -96,11 +118,18 @@ launch task:
   emulator, never touching Wine at all. The script only checks the emulator
   binary is installed and the game data is present — trying to verify a Wine
   prefix for these produces nothing but false negatives.
+- **`native`** — old-style GOG `.sh` Linux installers that pre-date the
+  `goggame-<id>.info` manifest convention entirely. They ship their own
+  bundled binaries (DOSBox, ScummVM or the game itself) plus a `start.sh`
+  launcher, with no manifest to read at all. Detected by the presence of an
+  executable `start.sh` when no manifest exists; verified by checking that
+  `start.sh` is present and executable — no Wine prefix and no system
+  emulator package required.
 
 ## Under the hood
 
 This is the part that was actually fun. Getting `patch` to reliably work
-required reverse-engineering three independent, undocumented failure modes:
+required reverse-engineering sixteen independent, undocumented failure modes:
 
 ### 1. Winetricks can't find `wineserver` on Debian/Ubuntu
 
@@ -219,6 +248,126 @@ first try. Lesson for future debugging: if one game keeps failing after every
 other game succeeds with the same fix, suspect prefix corruption (especially
 a prefix that was manually poked at) before chasing a new script bug.
 
+### 11. "Worms 2 isn't configured" turned out to mean *every* Wine game wasn't
+
+A report that a handful of games — Worms 2 among them — never got a Wine
+prefix or dependency check, no matter how many times `patch` ran. The
+registry showed `unknown_prefix` with an empty `wine_prefix`/`runner` for
+every single Wine-engine title, not just the reported ones (the DOSBox/
+ScummVM titles were fine, since they don't need Heroic's Wine config at all).
+Cause: Heroic was installed via Flatpak — which this script's own `setup`
+does by default — and a Flatpak app's config lives at
+`~/.var/app/com.heroicgameslauncher.hgl/config/heroic`, sandboxed away from
+the `~/.config/heroic` path the script had hardcoded. `find_heroic_config`
+was silently looking in a directory that simply didn't exist, so every Wine
+game fell back to "no prefix on record" — indistinguishable from a game
+that's never been launched. Fix: `detect_heroic_config_dir()` checks the
+native, Flatpak, and Snap paths and picks whichever one actually has
+Heroic's GOG install list (see [Heroic config
+auto-detection](#heroic-config-auto-detection)). One config-detection bug
+posing as N separate "this game won't configure" reports — worth remembering
+that a symptom reported on one item can be a total failure that just hasn't
+been reported on the others yet.
+
+### 12. Some GOG Linux installs have no manifest at all
+
+A `Constructor` install kept reporting `missing_exe` despite the executable
+clearly sitting right there in `data/GAME.EXE`. Cause: it was installed via
+GOG's old native Linux `.sh` installer format, which predates the
+`goggame-<id>.info` manifest convention — there was no manifest to read a
+primary executable from at all, so the engine detection fell through to its
+`wine` default and went looking for a Windows `.exe` path that was never
+recorded anywhere. These installs ship their own bundled DOSBox/ScummVM
+binaries plus a `start.sh` launcher and need neither Wine nor a system
+emulator package. Fix: a new `native` engine, detected by an executable
+`start.sh` when no manifest is present.
+
+### 13. Worms 2 was still unplayable after every fix above — `GOGLauncher.exe` itself is broken under Wine
+
+Even with its Wine prefix, dependencies, and Heroic config path all correct,
+launching Worms 2 just hung forever: no window, no error, 0% CPU, indefinitely.
+Tracing the process tree down to Wine's own `start.exe` helper revealed the
+actual argument it had been handed: `ARMAG.WMV#BANDIT.WMV#...#frontend.exe` —
+a literal, unparsed config value. GOG's generic `GOGLauncher.exe` (the
+manifest's primary launch task) plays a sequence of intro movies via
+`ShellExecute` before handing off to the game's real menu (`frontend.exe`);
+under Wine, with no registered `.wmv` handler, that `ShellExecute` call never
+resolves to anything and just hangs — forever, silently, with the process
+otherwise fully alive. Fix: `is_known_broken_launcher()` flags
+`GOGLauncher.exe` specifically, `find_launcher_override()` looks for the
+`frontend.exe` it would have handed off to, and `apply_launcher_override()`
+retargets it (see finding #16 for exactly how). Verified by launching
+`frontend.exe` directly and confirming a real, titled `Worms2` window appears
+in the X11 tree, versus zero window and zero CPU activity for `GOGLauncher.exe`.
+
+### 14. Even with the right executable, Worms 2 rendered nothing — needed the cnc-ddraw shim after all
+
+With `GOGLauncher.exe` bypassed, `frontend.exe` launched and ran (real CPU
+usage, Wine's `x11drv` visibly initializing) but still produced no visible
+window for a long stretch — a second, independent issue layered under the
+first. `frontend.exe` is a classic DirectDraw app, and Wine's own DirectDraw
+implementation couldn't drive it — exactly the failure mode `setup`'s own
+`download_retro_fixes` step already names Worms 2 as an example of, but the
+fix (`ddraw.dll`/`ddraw.ini` from
+[cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw)) was only ever a manual
+README tip, never actually applied anywhere. Fix: a short, explicit,
+GOG-id-keyed `NEEDS_CNC_DDRAW` table (seeded with Worms 2, confirmed by
+testing) that `patch` uses to copy `cnc-ddraw`'s `ddraw.dll` straight into a
+game's own install folder — Windows' DLL search order picks up a same-folder
+DLL ahead of any system one. Deliberately a curated, confirmed-only list
+rather than an inferred one: forcing this shim onto a game that already
+renders fine on its own risks breaking it instead. Verified the same way as
+above — a real `Worms2` window (642×437) only appeared in the X11 window tree
+once both this and the launcher-override fix were in place.
+
+### 15. The concurrency lock could get stuck forever after a completely successful run
+
+While testing the fixes above, a *second* `patch` invocation refused to start
+with "another instance is already running" — immediately after the first one
+had logged success and exited cleanly. Cause: `acquire_lock()`'s `flock` is
+tied to an open file descriptor (200), and every `wine`/`winetricks` call this
+script makes inherits that fd across fork/exec by default. Most of those
+child processes exit long before the script does, but not all — Wine's own
+long-lived per-prefix services (`services.exe`, `winedevice.exe`, ...) and,
+worse, `vc_redist.x86.exe`'s WiX/Burn installer (which relaunches itself as a
+separate *elevated* worker process) can keep running well after winetricks
+itself has returned success. flock's lock is held by the open file
+description, not by any one PID, so a single leaked child — one `patch` run
+of `vcrun2019` was enough — pins the lock forever, and every later
+`scan`/`verify`/`patch`/`doctor` invocation fails immediately, having done
+nothing, with no indication *why*. Fix: every external `wine`/`winetricks`/
+`wineserver` call now closes its copy of fd 200 (`200>&-`) before exec'ing,
+so only this script's own process ever holds the lock — exactly as the
+"held for the process's lifetime" design already intended.
+
+### 16. The launcher-override fix (#13) didn't actually survive a real Heroic launch
+
+The very first version of the fix worked perfectly in isolated testing —
+write Heroic's `targetExe` setting, watch `frontend.exe` render a real window
+— and then completely failed the moment the *user* tried launching Worms 2
+from an already-running Heroic: `targetExe` came back `null` in the config
+file, and the launch hung on `GOGLauncher.exe` exactly as before. Cause:
+Heroic keeps its own in-memory copy of every game's settings for as long as
+it's running, and rewrites the whole per-game config file *from that memory*
+on ordinary activity like a launch attempt — it never loaded our
+externally-written value in the first place, so the next thing it did was
+overwrite it back to empty. Any fix that only touches a config file Heroic
+also owns is fighting a process that can undo it at any moment.
+
+The durable alternative: `gogdl launch` (Heroic's own GOG backend) resolves
+the primary executable from `goggame-<id>.info`'s manifest fresh, every
+single launch, whenever no override is active — confirmed directly with
+`gogdl import <path>`, which echoes back the *current* manifest's resolved
+task, independent of Heroic's process state entirely. `installed.json`'s own
+`executable` field being permanently blank was the tell that nothing caches
+a resolved path elsewhere. Fix: `apply_launcher_override()` now edits the
+manifest's primary `FileTask` directly (backing up the original once, as
+`<manifest>.orig`) as the real fix, and still writes `targetExe` too as a
+harmless secondary attempt — but the manifest edit is what actually matters,
+and it has the useful side effect of making the fix self-idempotent: the
+next `scan` reads the already-corrected manifest and simply stops detecting
+a broken launcher at all, no separate "is this already fixed?" check needed.
+
 ## How the registry is built
 
 `scan` writes `~/.config/gog-companion/registry.json`, one entry per game,
@@ -270,14 +419,15 @@ Ideas worth doing next, roughly in order of "would make this more magical":
       refuse to run twice at once instead of racing.
 - [ ] **Plain-Wine runner support** — extend `init_wine_prefix` beyond
       Proton (`wine`/`wineboot` directly) for non-Proton Heroic configs.
-- [ ] **Per-game verb overrides** — some games need extra Winetricks verbs
-      (`dxvk`, `d3dcompiler_47`, `faudio`) beyond the generic set; let a game
-      declare its own list, keyed by GOG id, instead of one-size-fits-all.
-      Possibly seeded from community-maintained fix data (à la
-      [ProtonDB](https://www.protondb.com/) or Heroic's own
-      `protonfixes`/`ProtonFixesRoot`).
-- [ ] **`--only <game>` filter** — patch/verify a single game instead of the
-      whole library, for fast iteration.
+- [x] ~~**Per-game verb overrides**~~ — partially done: `NEEDS_CNC_DDRAW` and
+      `KNOWN_BROKEN_LAUNCHERS` are the same idea (a GOG-id/exe-name-keyed
+      table of confirmed per-game fixes) applied to the DirectDraw shim and
+      broken-launcher override rather than Winetricks verbs specifically.
+      Extending the same pattern to extra verbs (`dxvk`, `d3dcompiler_47`,
+      `faudio`) — possibly seeded from [ProtonDB](https://www.protondb.com/)
+      or Heroic's own `protonfixes`/`ProtonFixesRoot` — is still open.
+- [x] ~~**`--only <game>` filter**~~ — done: `--only <name-or-id>` limits
+      `scan`/`verify`/`patch`/`doctor` to a single game.
 - [ ] **Parallel patching** — process independent prefixes concurrently
       (bounded by CPU/network) instead of strictly serial.
 - [ ] **JSON/`--quiet` output mode** — machine-readable `list` output for
